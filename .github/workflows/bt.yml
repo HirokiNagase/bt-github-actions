@@ -1,0 +1,53 @@
+name: bt-estimate
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "scope label (e.g. all / event:<uuid> / user:<uuid>)"
+        required: false
+        default: "all"
+      event_id:
+        description: "filter by event_id (uuid)"
+        required: false
+      game_title_id:
+        description: "filter by game_title_id (uuid)"
+        required: false
+      format_id:
+        description: "filter by format_id (uuid)"
+        required: false
+      draw_mode:
+        description: "half or ignore"
+        required: false
+        default: "half"
+  schedule:
+    # 毎日 03:10 JST = 18:10 UTC（冬時間なし想定）
+    - cron: "10 18 * * *"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r bt/requirements.txt
+
+      - name: Run estimation
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BT_SCOPE: ${{ inputs.scope || 'all' }}
+          BT_EVENT_ID: ${{ inputs.event_id }}
+          BT_GAME_TITLE_ID: ${{ inputs.game_title_id }}
+          BT_FORMAT_ID: ${{ inputs.format_id }}
+          BT_DRAW_MODE: ${{ inputs.draw_mode || 'half' }}
+        run: |
+          python bt/estimate.py
