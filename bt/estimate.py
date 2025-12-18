@@ -18,9 +18,14 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 SCOPE = os.environ.get("BT_SCOPE", "all")
 
 # 任意フィルタ
-FILTER_EVENT_ID = os.environ.get("BT_EVENT_ID")  # uuid文字列
-FILTER_GAME_TITLE_ID = os.environ.get("BT_GAME_TITLE_ID")  # uuid文字列
-FILTER_FORMAT_ID = os.environ.get("BT_FORMAT_ID")  # uuid文字列
+def env_uuid(name: str) -> Optional[str]:
+    v = os.environ.get(name)
+    v = v.strip() if v else None
+    return v or None
+
+FILTER_EVENT_ID = env_uuid("BT_EVENT_ID")
+FILTER_GAME_TITLE_ID = env_uuid("BT_GAME_TITLE_ID")
+FILTER_FORMAT_ID = env_uuid("BT_FORMAT_ID")
 
 # DRAWの扱い： "half"=0.5勝扱い / "ignore"=捨てる
 DRAW_MODE = os.environ.get("BT_DRAW_MODE", "ignore")
