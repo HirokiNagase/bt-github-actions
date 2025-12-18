@@ -291,7 +291,7 @@ def main() -> None:
             return
 
         # ★変更：観測(obs)とペア統計(pair_stats)も作る
-        obs, id_list, n_games, pair_stats = build_obs_and_pair_stats(rows)
+        obs, id_to_idx, id_list, n_games, pair_stats = build_obs_and_pair_stats(rows)
 
         if len(obs) == 0:
             print("No usable observations (maybe all DRAW ignored).")
