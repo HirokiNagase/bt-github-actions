@@ -1,13 +1,13 @@
 import os
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, DefaultDict
 
 import numpy as np
 import psycopg
 from psycopg.rows import dict_row
 from scipy.optimize import minimize
-
+from collections import defaultdict
 
 # -----------------------------
 # 設定（環境変数で上書き）
@@ -91,13 +91,13 @@ def fetch_matches(conn: psycopg.Connection) -> Tuple[List[MatchRow], Optional[st
     return rows, game_title_id, format_id
 
 
-def build_pairs(rows: List[MatchRow]) -> Tuple[List[Tuple[int, int, float]], Dict[str, int], List[str], Dict[int, int]]:
+
+
+def build_obs_and_pair_stats(rows: List[MatchRow]):
     """
-    BTに渡すために
-    - archtype_id -> index
-    - 観測: (winner_idx, loser_idx, weight)
-    に変換する。
-    DRAWは half なら 0.5勝/0.5敗として2本に分ける。
+    - BT用観測: (winner_idx, loser_idx, weight)
+    - ペア統計: (min_idx, max_idx) -> {n, i_wins, j_wins, draws}
+      ※ここではペアは順序なしでまとめる（min/maxで正規化）
     """
     ids = set()
     for r in rows:
@@ -107,31 +107,50 @@ def build_pairs(rows: List[MatchRow]) -> Tuple[List[Tuple[int, int, float]], Dic
     id_to_idx = {a: i for i, a in enumerate(id_list)}
 
     obs: List[Tuple[int, int, float]] = []
+
+    # 対戦数（アーキ別）
     n_games: Dict[int, int] = {i: 0 for i in range(len(id_list))}
+
+    # ペア統計（順序なし）
+    pair_stats: DefaultDict[Tuple[int, int], Dict[str, int]] = defaultdict(
+        lambda: {"n": 0, "low_wins": 0, "high_wins": 0, "draws": 0}
+    )
 
     for r in rows:
         i = id_to_idx[r.my_archtype_id]
         j = id_to_idx[r.opp_archtype_id]
+        low, high = (i, j) if i < j else (j, i)
+
+        # 試合数カウント（双方+1）
+        n_games[i] += 1
+        n_games[j] += 1
+
+        st = pair_stats[(low, high)]
+        st["n"] += 1
 
         if r.result == "WIN":
+            # i が勝者
             obs.append((i, j, 1.0))
-            n_games[i] += 1
-            n_games[j] += 1
+            if i == low:
+                st["low_wins"] += 1
+            else:
+                st["high_wins"] += 1
         elif r.result == "LOSE":
+            # j が勝者
             obs.append((j, i, 1.0))
-            n_games[i] += 1
-            n_games[j] += 1
+            if j == low:
+                st["low_wins"] += 1
+            else:
+                st["high_wins"] += 1
         elif r.result == "DRAW":
+            st["draws"] += 1
             if DRAW_MODE == "ignore":
                 continue
-            # half: iがjに0.5勝、jがiに0.5勝
+            # half: 両方に0.5勝としてBT観測に入れる
             obs.append((i, j, 0.5))
             obs.append((j, i, 0.5))
-            n_games[i] += 1
-            n_games[j] += 1
 
-    return obs, id_to_idx, id_list, n_games
-
+    return obs, id_to_idx, id_list, n_games, pair_stats
 
 def fit_bradley_terry(n_items: int, obs: List[Tuple[int, int, float]]) -> np.ndarray:
     """
@@ -182,49 +201,81 @@ def fit_bradley_terry(n_items: int, obs: List[Tuple[int, int, float]]) -> np.nda
     return theta
 
 
-def upsert_ratings(
+def upsert_matchup_probs(
     conn: psycopg.Connection,
     as_of_iso: str,
     scope: str,
-    game_title_id: Optional[str],
-    format_id: Optional[str],
+    game_title_id: str,
+    format_id: str,
     archtype_ids: List[str],
     theta: np.ndarray,
-    n_games: Dict[int, int],
+    pair_stats,
 ) -> None:
     """
-    bt_archtype_ratings に upsert（最新値で上書き）
+    実対戦があるペアだけ保存。
+    A→B と B→A を両方 upsert する。
     """
-    # rating = exp(theta)
-    rating = np.exp(theta)
-
     sql = """
-    insert into bt_archtype_ratings
-      (as_of, game_title_id, format_id, scope, archtype_id, theta, rating, n_games, updated_datetime)
+    insert into bt_matchup_probs
+      (as_of, scope, game_title_id, format_id,
+       archtype_a_id, archtype_b_id,
+       p_a_win, n_ab, a_wins, b_wins, draws, updated_datetime)
     values
-      (%(as_of)s, %(game_title_id)s, %(format_id)s, %(scope)s, %(archtype_id)s, %(theta)s, %(rating)s, %(n_games)s, now())
-    on conflict (scope, game_title_id, format_id, archtype_id)
+      (%(as_of)s, %(scope)s, %(game_title_id)s, %(format_id)s,
+       %(a)s, %(b)s,
+       %(p)s, %(n)s, %(a_wins)s, %(b_wins)s, %(draws)s, now())
+    on conflict (scope, game_title_id, format_id, archtype_a_id, archtype_b_id)
     do update set
       as_of = excluded.as_of,
-      theta = excluded.theta,
-      rating = excluded.rating,
-      n_games = excluded.n_games,
+      p_a_win = excluded.p_a_win,
+      n_ab = excluded.n_ab,
+      a_wins = excluded.a_wins,
+      b_wins = excluded.b_wins,
+      draws = excluded.draws,
       updated_datetime = now()
     """
 
+    def sigmoid(x: float) -> float:
+        return 1.0 / (1.0 + np.exp(-x))
+
     with conn.cursor() as cur:
-        for idx, arch_id in enumerate(archtype_ids):
+        for (low, high), st in pair_stats.items():
+            # 順序なしペア(low,high)を、両方向に展開する
+            a_id = archtype_ids[low]
+            b_id = archtype_ids[high]
+
+            p_low_win = float(sigmoid(theta[low] - theta[high]))
+            p_high_win = 1.0 - p_low_win
+
+            # low -> high
             cur.execute(sql, {
                 "as_of": as_of_iso,
+                "scope": scope,
                 "game_title_id": game_title_id,
                 "format_id": format_id,
-                "scope": scope,
-                "archtype_id": arch_id,
-                "theta": float(theta[idx]),
-                "rating": float(rating[idx]),
-                "n_games": int(n_games.get(idx, 0)),
+                "a": a_id,
+                "b": b_id,
+                "p": p_low_win,
+                "n": int(st["n"]),
+                "a_wins": int(st["low_wins"]),
+                "b_wins": int(st["high_wins"]),
+                "draws": int(st["draws"]),
             })
 
+            # high -> low（勝数も入れ替える）
+            cur.execute(sql, {
+                "as_of": as_of_iso,
+                "scope": scope,
+                "game_title_id": game_title_id,
+                "format_id": format_id,
+                "a": b_id,
+                "b": a_id,
+                "p": p_high_win,
+                "n": int(st["n"]),
+                "a_wins": int(st["high_wins"]),
+                "b_wins": int(st["low_wins"]),
+                "draws": int(st["draws"]),
+            })
 
 def main() -> None:
     as_of_iso = os.environ.get("BT_AS_OF")  # 例: 2025-12-18T00:00:00Z
@@ -239,15 +290,24 @@ def main() -> None:
             print("No matches found. Nothing to estimate.")
             return
 
-        obs, id_to_idx, id_list, n_games = build_pairs(rows)
+        # ★変更：観測(obs)とペア統計(pair_stats)も作る
+        obs, id_list, n_games, pair_stats = build_obs_and_pair_stats(rows)
+
         if len(obs) == 0:
             print("No usable observations (maybe all DRAW ignored).")
             return
 
         theta = fit_bradley_terry(len(id_list), obs)
 
-        # 書き込み
-        upsert_ratings(
+        # ★追加：実対戦があるペアだけ A vs B 勝率を保存
+        # bt_matchup_probs が NOT NULL の想定なので、ここで必須チェック
+        if not game_title_id or not format_id:
+            raise RuntimeError(
+                "game_title_id / format_id must be set for bt_matchup_probs (NOT NULL). "
+                "Pass BT_GAME_TITLE_ID and BT_FORMAT_ID, or adjust schema."
+            )
+
+        upsert_matchup_probs(
             conn=conn,
             as_of_iso=as_of_iso,
             scope=SCOPE,
@@ -255,15 +315,22 @@ def main() -> None:
             format_id=format_id,
             archtype_ids=id_list,
             theta=theta,
-            n_games=n_games,
+            pair_stats=pair_stats,
         )
+
         conn.commit()
 
         # ざっくり上位表示（ログ）
         order = np.argsort(-np.exp(theta))
         print("Top 10 ratings:")
         for k in order[:10]:
-            print(f"{id_list[k]} rating={math.exp(theta[k]):.4f} theta={theta[k]:+.4f} n_games={n_games.get(int(k),0)}")
+            print(
+                f"{id_list[k]} rating={math.exp(theta[k]):.4f} "
+                f"theta={theta[k]:+.4f} n_games={n_games.get(int(k), 0)}"
+            )
+
+        # ★追加：ペア数ログ（動いてるか確認しやすい）
+        print(f"Matchup pairs saved (undirected): {len(pair_stats)}")
 
 
 if __name__ == "__main__":
