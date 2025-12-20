@@ -59,8 +59,8 @@ jobs:
           #   format_id:     "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
           #
           # 実運用ではここに「運用したい全組み合わせ」を並べる
-          - game_title_id: "${{ vars.BT_GAME_TITLE_ID_1 }}"
-            format_id: "${{ vars.BT_FORMAT_ID_1 }}"
+          # - game_title_id: "${{ vars.BT_GAME_TITLE_ID_1 }}"
+          #   format_id: "${{ vars.BT_FORMAT_ID_1 }}"
 
     steps:
       - uses: actions/checkout@v4

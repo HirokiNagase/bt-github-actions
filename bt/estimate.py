@@ -1,5 +1,6 @@
 import os
 import math
+import hashlib
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, DefaultDict
 
@@ -9,7 +10,7 @@ from psycopg.rows import dict_row
 from scipy.optimize import minimize
 from collections import defaultdict
 
-from datetime import datetime, timedelta, timezone  # ★追加（週区切りUTC計算用）
+from datetime import datetime, timedelta, timezone
 
 # =============================================================================
 # このスクリプトの目的
@@ -42,10 +43,8 @@ from datetime import datetime, timedelta, timezone  # ★追加（週区切りUT
 # -----------------------------
 DATABASE_URL = os.environ["DATABASE_URL"]
 
-# 出力スコープ（all / event:<uuid> / user:<uuid> など）
 SCOPE = os.environ.get("BT_SCOPE", "all")
 
-# 任意フィルタ
 def env_uuid(name: str) -> Optional[str]:
     """
     環境変数から uuid の文字列を取る（空文字は None 扱い）。
@@ -85,9 +84,26 @@ DRAW_MODE = os.environ.get("BT_DRAW_MODE", "ignore")
 #   何週間分遡るか（通常 1）
 # -----------------------------------------------------------------------------
 
+# CIと数値安定化
+# 区間の信頼係数（95%CIなら 1.96）
+# 例:
+#   90% CI ≈ 1.645
+#   95% CI ≈ 1.96
+#   99% CI ≈ 2.576
+CI_Z = float(os.environ.get("BT_CI_Z", "1.96"))
+# Hessianの数値安定化（微小な正則化）
+# データが疎だったり、デッキ同士がほとんど当たっていない場合に
+# ヘッセ行列の逆が不安定になることがあるため、微小な対角成分を足す。
+HESSIAN_RIDGE = float(os.environ.get("BT_HESSIAN_RIDGE", "1e-9"))
+
 # 手動指定（envモードで使用）
 BT_TIME_FROM = os.environ.get("BT_TIME_FROM")  # inclusive
 BT_TIME_TO = os.environ.get("BT_TIME_TO")      # exclusive
+
+
+# =============================================================================
+# 期間ウィンドウ（matched_datetime は tz無しで UTC を意味する前提）
+# =============================================================================
 
 def compute_week_window_utc(
     *,
@@ -95,11 +111,8 @@ def compute_week_window_utc(
     weeks_back: int = 1,
 ) -> Tuple[str, str]:
     """
-    UTC週区切り（月曜0:00 UTC）で [from, to) を作り、
-    matched_datetime（tz無し）に合わせて 'YYYY-MM-DD HH:MM:SS' で返す。
-
-    なぜ [from,to) なのか:
-      - inclusive/exclusive にすると、週を跨いだ集計で境界が二重カウントされない。
+    UTC週区切り（月曜0:00 UTC）で [from,to) を作り、
+    DBの matched_datetime（tz無し）に合わせて 'YYYY-MM-DD HH:MM:SS' で返す。
     """
     if anchor_utc is None:
         anchor_utc = datetime.now(timezone.utc)
@@ -108,7 +121,7 @@ def compute_week_window_utc(
 
     # 直近の「月曜 00:00:00 UTC」を求める
     # weekday(): Mon=0 ... Sun=6
-    days_since_monday = anchor_utc.weekday()
+    days_since_monday = anchor_utc.weekday()  # Mon=0
     this_monday_00 = (anchor_utc - timedelta(days=days_since_monday)).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
@@ -120,6 +133,7 @@ def compute_week_window_utc(
         return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     return fmt(from_utc), fmt(to_utc)
+
 
 def resolve_time_filter_window_utc() -> Tuple[Optional[str], Optional[str]]:
     """
@@ -153,18 +167,9 @@ def resolve_time_filter_window_utc() -> Tuple[Optional[str], Optional[str]]:
     raise ValueError(f"Unknown BT_TIME_FILTER_MODE={mode!r}")
 
 
-# 区間の信頼係数（95%CIなら 1.96）
-# 例:
-#   90% CI ≈ 1.645
-#   95% CI ≈ 1.96
-#   99% CI ≈ 2.576
-CI_Z = float(os.environ.get("BT_CI_Z", "1.96"))
-
-# Hessianの数値安定化（微小な正則化）
-# データが疎だったり、デッキ同士がほとんど当たっていない場合に
-# ヘッセ行列の逆が不安定になることがあるため、微小な対角成分を足す。
-HESSIAN_RIDGE = float(os.environ.get("BT_HESSIAN_RIDGE", "1e-9"))
-
+# =============================================================================
+# DB読み取り
+# =============================================================================
 
 @dataclass
 class MatchRow:
@@ -179,18 +184,13 @@ class MatchRow:
     result: str  # WIN/LOSE/DRAW
 
 
-def fetch_matches(conn: psycopg.Connection) -> Tuple[List[MatchRow], Optional[str], Optional[str]]:
-    """
-    DBから対戦結果を取り出す。
-
-    NOTE:
-      - ここでは user_decks.deck_id をアーキタイプIDとして扱っている（スキーマ仕様）。
-      - format_id は user_decks にないため archtypes.format_id を使って絞っている。
-      - game_title_id / format_id は「フィルタ指定された値」をそのまま出力に入れる。
-        => bt_matchup_probs の NOT NULL 制約があるので、環境変数で指定必須になる。
-    """
+def fetch_matches(
+    conn: psycopg.Connection,
+    time_from: Optional[str],
+    time_to: Optional[str],
+) -> Tuple[List[MatchRow], Optional[str], Optional[str]]:
     where = ["m.is_delete = false", "ud.is_delete = false", "m.result in ('WIN','LOSE','DRAW')"]
-    params = {}
+    params: Dict[str, object] = {}
 
     if FILTER_EVENT_ID:
         where.append("m.event_id = %(event_id)s")
@@ -204,14 +204,10 @@ def fetch_matches(conn: psycopg.Connection) -> Tuple[List[MatchRow], Optional[st
         where.append("a_my.format_id = %(format_id)s")
         params["format_id"] = FILTER_FORMAT_ID
 
-    # ★変更：期間フィルタ（matched_datetimeをUTCとして解釈して絞る）
-    # 手動指定(env) or 自動週区切り(auto_weekly_utc) or 無効(off) を切り替え可能。
-    time_from, time_to = resolve_time_filter_window_utc()
-
+    # 期間フィルタ（matched_datetime を UTC として扱う前提）
     if time_from:
         where.append("m.matched_datetime >= %(time_from)s")
         params["time_from"] = time_from
-
     if time_to:
         where.append("m.matched_datetime < %(time_to)s")
         params["time_to"] = time_to
@@ -239,9 +235,7 @@ def fetch_matches(conn: psycopg.Connection) -> Tuple[List[MatchRow], Optional[st
                 result=str(r["result"]),
             ))
 
-    game_title_id = FILTER_GAME_TITLE_ID
-    format_id = FILTER_FORMAT_ID
-    return rows, game_title_id, format_id
+    return rows, FILTER_GAME_TITLE_ID, FILTER_FORMAT_ID
 
 
 def build_obs_and_pair_stats(rows: List[MatchRow]):
@@ -282,10 +276,8 @@ def build_obs_and_pair_stats(rows: List[MatchRow]):
     id_to_idx = {a: i for i, a in enumerate(id_list)}
 
     obs: List[Tuple[int, int, float]] = []
-
     # 対戦数（アーキ別）: そのアーキが関与した試合数（双方+1）
     n_games: Dict[int, int] = {i: 0 for i in range(len(id_list))}
-
     # ペア統計（順序なし）
     pair_stats: DefaultDict[Tuple[int, int], Dict[str, int]] = defaultdict(
         lambda: {"n": 0, "low_wins": 0, "high_wins": 0, "draws": 0}
@@ -309,7 +301,6 @@ def build_obs_and_pair_stats(rows: List[MatchRow]):
                 st["low_wins"] += 1
             else:
                 st["high_wins"] += 1
-
         elif r.result == "LOSE":
             # my視点でLOSE → 相手(j)が勝者
             obs.append((j, i, 1.0))
@@ -317,13 +308,11 @@ def build_obs_and_pair_stats(rows: List[MatchRow]):
                 st["low_wins"] += 1
             else:
                 st["high_wins"] += 1
-
         elif r.result == "DRAW":
             st["draws"] += 1
             if DRAW_MODE == "ignore":
                 # 引き分けをモデルに入れない（情報を使わない）
                 continue
-
             # half: 引き分けを「双方0.5勝」として扱う簡易版
             # （厳密な引き分けモデルを入れたい場合は別モデルになる）
             obs.append((i, j, 0.5))
@@ -333,7 +322,7 @@ def build_obs_and_pair_stats(rows: List[MatchRow]):
 
 
 # =============================================================================
-# BT推定（theta と共分散 cov）
+# BT推定（theta + cov）
 # =============================================================================
 
 def _sigmoid_stable(x: float) -> float:
@@ -409,11 +398,9 @@ def fit_bradley_terry_with_cov(
         g = np.zeros_like(t)
         for w, l, weight in obs:
             d = t[w] - t[l]
-            # sigmoid(-d) = 1/(1+exp(d))
-            s = 1.0 / (1.0 + np.exp(d))
+            s = 1.0 / (1.0 + np.exp(d))  # sigmoid(-d)
             g[w] += -weight * s
             g[l] += +weight * s
-
         # 平均0制約（中心化）と整合させるため、勾配も平均を0に寄せる
         g -= g.mean()
         return g
@@ -443,9 +430,7 @@ def fit_bradley_terry_with_cov(
     # 平均0制約の部分空間へ射影（1ベクトル方向を落とす）
     one = np.ones((n_items, 1), dtype=float)
     P = np.eye(n_items) - (one @ one.T) / n_items
-
     Hc = P @ H @ P
-
     # 制約空間で擬似逆を取って共分散近似にする
     cov = np.linalg.pinv(Hc)
     return theta, cov
@@ -466,13 +451,7 @@ def _pair_logit_se(cov: np.ndarray, a: int, b: int) -> float:
     return math.sqrt(var_m)
 
 
-def _matchup_prob_and_ci(
-    theta: np.ndarray,
-    cov: np.ndarray,
-    a: int,
-    b: int,
-    z: float,
-) -> Tuple[float, float, float, float]:
+def _matchup_prob_and_ci(theta: np.ndarray, cov: np.ndarray, a: int, b: int, z: float) -> Tuple[float, float, float, float]:
     """
     a vs b の
       - 推定勝率 p = sigmoid(theta[a]-theta[b])
@@ -488,21 +467,110 @@ def _matchup_prob_and_ci(
     """
     m = float(theta[a] - theta[b])
     se_m = _pair_logit_se(cov, a, b)
-
     p = _sigmoid_stable(m)
-    m_lo = m - z * se_m
-    m_hi = m + z * se_m
-    p_lo = _sigmoid_stable(m_lo)
-    p_hi = _sigmoid_stable(m_hi)
+    p_lo = _sigmoid_stable(m - z * se_m)
+    p_hi = _sigmoid_stable(m + z * se_m)
     return p, p_lo, p_hi, se_m
+
+
+# =============================================================================
+# ★追加：run を作る
+# =============================================================================
+
+def _make_config_hash(
+    *,
+    scope: str,
+    event_id: Optional[str],
+    game_title_id: str,
+    format_id: str,
+    draw_mode: str,
+    ci_z: float,
+    ridge: float,
+    window_from: Optional[str],
+    window_to: Optional[str],
+) -> str:
+    """
+    実行条件を1つの文字列にまとめてハッシュ化（比較・追跡用）。
+    """
+    payload = "|".join([
+        f"scope={scope}",
+        f"event_id={event_id or ''}",
+        f"game_title_id={game_title_id}",
+        f"format_id={format_id}",
+        f"draw_mode={draw_mode}",
+        f"ci_z={ci_z}",
+        f"ridge={ridge}",
+        f"window_from={window_from or ''}",
+        f"window_to={window_to or ''}",
+    ])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def create_run(
+    conn: psycopg.Connection,
+    *,
+    window_from: Optional[str],
+    window_to: Optional[str],
+    n_rows: int,
+    n_items: int,
+    n_obs: int,
+) -> str:
+    """
+    bt_matchup_runs に1行insertして run_id を返す。
+    """
+    if not FILTER_GAME_TITLE_ID or not FILTER_FORMAT_ID:
+        raise RuntimeError(
+            "BT_GAME_TITLE_ID / BT_FORMAT_ID must be set because bt_matchup_runs requires NOT NULL."
+        )
+
+    config_hash = _make_config_hash(
+        scope=SCOPE,
+        event_id=FILTER_EVENT_ID,
+        game_title_id=FILTER_GAME_TITLE_ID,
+        format_id=FILTER_FORMAT_ID,
+        draw_mode=DRAW_MODE,
+        ci_z=CI_Z,
+        ridge=HESSIAN_RIDGE,
+        window_from=window_from,
+        window_to=window_to,
+    )
+
+    sql = """
+    insert into bt_matchup_runs
+      (window_from, window_to, scope, event_id, game_title_id, format_id,
+       draw_mode, ci_z, hessian_ridge,
+       n_rows, n_items, n_obs, config_hash)
+    values
+      (%(window_from)s, %(window_to)s, %(scope)s, %(event_id)s, %(game_title_id)s, %(format_id)s,
+       %(draw_mode)s, %(ci_z)s, %(hessian_ridge)s,
+       %(n_rows)s, %(n_items)s, %(n_obs)s, %(config_hash)s)
+    returning run_id
+    """
+
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, {
+            "window_from": window_from,  # 'YYYY-MM-DD HH:MM:SS' or None
+            "window_to": window_to,
+            "scope": SCOPE,
+            "event_id": FILTER_EVENT_ID,
+            "game_title_id": FILTER_GAME_TITLE_ID,
+            "format_id": FILTER_FORMAT_ID,
+            "draw_mode": DRAW_MODE,
+            "ci_z": CI_Z,
+            "hessian_ridge": HESSIAN_RIDGE,
+            "n_rows": int(n_rows),
+            "n_items": int(n_items),
+            "n_obs": int(n_obs),
+            "config_hash": config_hash,
+        })
+        r = cur.fetchone()
+        return str(r["run_id"])
 
 
 def upsert_matchup_probs(
     conn: psycopg.Connection,
-    as_of_iso: str,
-    scope: str,
-    game_title_id: str,
-    format_id: str,
+    *,
+    run_id: str,
     archtype_ids: List[str],
     theta: np.ndarray,
     cov: np.ndarray,
@@ -510,33 +578,21 @@ def upsert_matchup_probs(
     z: float = CI_Z,
 ) -> None:
     """
-    bt_matchup_probs へ、実対戦があるペアだけ保存する。
-
-    保存内容（A→Bの行）:
-      - n_ab: 実対戦数（観測数）
-      - a_wins / b_wins / draws: 実測の勝敗回数（参考）
-      - p_a_win:     BTモデルから推定した AがBに勝つ確率
-      - p_a_win_lo:  推定勝率の下限（信頼区間）
-      - p_a_win_hi:  推定勝率の上限（信頼区間）
-      - se_logit:    logit差の標準誤差（診断用・UIで非表示でもOK）
-
-    ここでは (low,high) の順序なし統計を
-      low->high と high->low の2行に展開して保存する。
+    ★変更：bt_matchup_probs は run_id 配下に保存する。
     """
     sql = """
     insert into bt_matchup_probs
-      (as_of, scope, game_title_id, format_id,
+      (run_id,
        archtype_a_id, archtype_b_id,
        p_a_win, p_a_win_lo, p_a_win_hi, se_logit,
        n_ab, a_wins, b_wins, draws, updated_datetime)
     values
-      (%(as_of)s, %(scope)s, %(game_title_id)s, %(format_id)s,
+      (%(run_id)s,
        %(a)s, %(b)s,
        %(p)s, %(p_lo)s, %(p_hi)s, %(se_logit)s,
        %(n)s, %(a_wins)s, %(b_wins)s, %(draws)s, now())
-    on conflict (scope, game_title_id, format_id, archtype_a_id, archtype_b_id)
+    on conflict (run_id, archtype_a_id, archtype_b_id)
     do update set
-      as_of = excluded.as_of,
       p_a_win = excluded.p_a_win,
       p_a_win_lo = excluded.p_a_win_lo,
       p_a_win_hi = excluded.p_a_win_hi,
@@ -553,105 +609,4 @@ def upsert_matchup_probs(
             a_id = archtype_ids[low]
             b_id = archtype_ids[high]
 
-            # low -> high
             p, p_lo, p_hi, se_m = _matchup_prob_and_ci(theta, cov, low, high, z)
-            cur.execute(sql, {
-                "as_of": as_of_iso,
-                "scope": scope,
-                "game_title_id": game_title_id,
-                "format_id": format_id,
-                "a": a_id,
-                "b": b_id,
-                "p": float(p),
-                "p_lo": float(p_lo),
-                "p_hi": float(p_hi),
-                "se_logit": float(se_m),
-                "n": int(st["n"]),
-                "a_wins": int(st["low_wins"]),
-                "b_wins": int(st["high_wins"]),
-                "draws": int(st["draws"]),
-            })
-
-            # high -> low（勝数も入れ替える）
-            p2, p2_lo, p2_hi, se_m2 = _matchup_prob_and_ci(theta, cov, high, low, z)
-            cur.execute(sql, {
-                "as_of": as_of_iso,
-                "scope": scope,
-                "game_title_id": game_title_id,
-                "format_id": format_id,
-                "a": b_id,
-                "b": a_id,
-                "p": float(p2),
-                "p_lo": float(p2_lo),
-                "p_hi": float(p2_hi),
-                "se_logit": float(se_m2),
-                "n": int(st["n"]),
-                "a_wins": int(st["high_wins"]),
-                "b_wins": int(st["low_wins"]),
-                "draws": int(st["draws"]),
-            })
-
-
-def main() -> None:
-    """
-    エントリポイント。
-    1) DBから試合を取る
-    2) 観測(obs)を作る
-    3) BT推定で theta + cov を作る
-    4) マッチアップ推定勝率と信頼区間を保存する
-    """
-    as_of_iso = os.environ.get("BT_AS_OF")  # 例: 2025-12-18T00:00:00Z
-    if not as_of_iso:
-        as_of_iso = datetime.now(timezone.utc).isoformat()
-
-    with psycopg.connect(DATABASE_URL) as conn:
-        rows, game_title_id, format_id = fetch_matches(conn)
-        if len(rows) == 0:
-            print("No matches found. Nothing to estimate.")
-            return
-
-        obs, id_to_idx, id_list, n_games, pair_stats = build_obs_and_pair_stats(rows)
-
-        if len(obs) == 0:
-            print("No usable observations (maybe all DRAW ignored).")
-            return
-
-        theta, cov = fit_bradley_terry_with_cov(len(id_list), obs)
-
-        if not game_title_id or not format_id:
-            raise RuntimeError(
-                "game_title_id / format_id must be set for bt_matchup_probs (NOT NULL). "
-                "Pass BT_GAME_TITLE_ID and BT_FORMAT_ID, or adjust schema."
-            )
-
-        upsert_matchup_probs(
-            conn=conn,
-            as_of_iso=as_of_iso,
-            scope=SCOPE,
-            game_title_id=game_title_id,
-            format_id=format_id,
-            archtype_ids=id_list,
-            theta=theta,
-            cov=cov,
-            pair_stats=pair_stats,
-            z=CI_Z,
-        )
-
-        conn.commit()
-
-        # ログ: 上位のtheta（参考）
-        order = np.argsort(-np.exp(theta))
-        print("Top 10 ratings:")
-        for k in order[:10]:
-            # cov[k,k] は theta[k] の分散（近似）。sqrtで標準誤差。
-            se_k = math.sqrt(max(float(cov[k, k]), 0.0))
-            print(
-                f"{id_list[k]} rating={math.exp(theta[k]):.4f} "
-                f"theta={theta[k]:+.4f} se={se_k:.4f} n_games={n_games.get(int(k), 0)}"
-            )
-
-        print(f"Matchup pairs saved (undirected): {len(pair_stats)}")
-
-
-if __name__ == "__main__":
-    main()
