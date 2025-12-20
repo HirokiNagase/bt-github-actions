@@ -610,3 +610,85 @@ def upsert_matchup_probs(
             b_id = archtype_ids[high]
 
             p, p_lo, p_hi, se_m = _matchup_prob_and_ci(theta, cov, low, high, z)
+            cur.execute(sql, {
+                "run_id": run_id,
+                "a": a_id,
+                "b": b_id,
+                "p": float(p),
+                "p_lo": float(p_lo),
+                "p_hi": float(p_hi),
+                "se_logit": float(se_m),
+                "n": int(st["n"]),
+                "a_wins": int(st["low_wins"]),
+                "b_wins": int(st["high_wins"]),
+                "draws": int(st["draws"]),
+            })
+
+            p2, p2_lo, p2_hi, se_m2 = _matchup_prob_and_ci(theta, cov, high, low, z)
+            cur.execute(sql, {
+                "run_id": run_id,
+                "a": b_id,
+                "b": a_id,
+                "p": float(p2),
+                "p_lo": float(p2_lo),
+                "p_hi": float(p2_hi),
+                "se_logit": float(se_m2),
+                "n": int(st["n"]),
+                "a_wins": int(st["high_wins"]),
+                "b_wins": int(st["low_wins"]),
+                "draws": int(st["draws"]),
+            })
+
+
+def main() -> None:
+    # runの実行時刻（ログ用途。DBの executed_at は now()）
+    as_of_iso = os.environ.get("BT_AS_OF")
+    if not as_of_iso:
+        as_of_iso = datetime.now(timezone.utc).isoformat()
+
+    # ★期間をここで確定（fetchとrun保存で同じ値を使う）
+    window_from, window_to = resolve_time_filter_window_utc()
+
+    with psycopg.connect(DATABASE_URL) as conn:
+        rows, game_title_id, format_id = fetch_matches(conn, window_from, window_to)
+        if len(rows) == 0:
+            print("No matches found. Nothing to estimate.")
+            return
+
+        obs, id_to_idx, id_list, n_games, pair_stats = build_obs_and_pair_stats(rows)
+        if len(obs) == 0:
+            print("No usable observations (maybe all DRAW ignored).")
+            return
+
+        theta, cov = fit_bradley_terry_with_cov(len(id_list), obs)
+
+        # ★run作成（この run_id に結果が紐づく）
+        run_id = create_run(
+            conn,
+            window_from=window_from,
+            window_to=window_to,
+            n_rows=len(rows),
+            n_items=len(id_list),
+            n_obs=len(obs),
+        )
+
+        # ★run_id配下に保存
+        upsert_matchup_probs(
+            conn,
+            run_id=run_id,
+            archtype_ids=id_list,
+            theta=theta,
+            cov=cov,
+            pair_stats=pair_stats,
+            z=CI_Z,
+        )
+
+        conn.commit()
+
+        # 参考ログ
+        print(f"run_id={run_id} as_of={as_of_iso} window=[{window_from},{window_to}) rows={len(rows)} obs={len(obs)} items={len(id_list)}")
+        print(f"Matchup pairs saved (undirected): {len(pair_stats)}")
+
+
+if __name__ == "__main__":
+    main()
