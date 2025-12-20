@@ -10,24 +10,57 @@ on:
       event_id:
         description: "filter by event_id (uuid)"
         required: false
-      game_title_id:
-        description: "filter by game_title_id (uuid)"
-        required: false
-      format_id:
-        description: "filter by format_id (uuid)"
-        required: false
       draw_mode:
         description: "half or ignore"
         required: false
         default: "half"
-  schedule:
-    # 毎日 03:10 JST = 18:10 UTC（冬時間なし想定）
-    - cron: "10 18 * * *"
+
+      # ★追加：期間フィルタの切り替え
+      time_filter_mode:
+        description: "time filter mode: auto_weekly_utc / env / off"
+        required: false
+        default: "auto_weekly_utc"
+
+      # ★envモード用（matched_datetime は 'YYYY-MM-DD HH:MM:SS' 形式推奨）
+      time_from:
+        description: "BT_TIME_FROM (inclusive) e.g. 2025-12-13 00:00:00 (used when mode=env)"
+        required: false
+      time_to:
+        description: "BT_TIME_TO (exclusive) e.g. 2025-12-20 00:00:00 (used when mode=env)"
+        required: false
+
+      # ★auto_weekly_utc 用（再現性/期間調整）
+      weeks_back:
+        description: "weeks back for auto_weekly_utc (default 1)"
+        required: false
+        default: "1"
+      weekly_anchor_iso:
+        description: "anchor time for auto_weekly_utc e.g. 2025-12-20T12:00:00Z (optional)"
+        required: false
+
+  # schedule:
+  #   # ★週1（例：月曜 00:10 JST = 日曜 15:10 UTC）
+  #   - cron: "10 15 * * 0"
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
+    # ★ゲーム×フォーマット別に回す（ここはあなたの実IDに置き換え）
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- 例（ダミー） ---
+          # - game_title_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+          #   format_id:     "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
+          # - game_title_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+          #   format_id:     "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+          #
+          # 実運用ではここに「運用したい全組み合わせ」を並べる
+          - game_title_id: "${{ vars.BT_GAME_TITLE_ID_1 }}"
+            format_id: "${{ vars.BT_FORMAT_ID_1 }}"
 
     steps:
       - uses: actions/checkout@v4
@@ -44,10 +77,23 @@ jobs:
       - name: Run estimation
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+          # フィルタ/設定
           BT_SCOPE: ${{ inputs.scope || 'all' }}
           BT_EVENT_ID: ${{ inputs.event_id }}
-          BT_GAME_TITLE_ID: ${{ inputs.game_title_id }}
-          BT_FORMAT_ID: ${{ inputs.format_id }}
           BT_DRAW_MODE: ${{ inputs.draw_mode || 'half' }}
+
+          # ★ゲーム/フォーマットは matrix から
+          BT_GAME_TITLE_ID: ${{ matrix.game_title_id }}
+          BT_FORMAT_ID: ${{ matrix.format_id }}
+
+          # ★期間フィルタ
+          # schedule実行のとき inputs は空になるので、デフォルトで auto_weekly_utc に寄せる
+          BT_TIME_FILTER_MODE: ${{ inputs.time_filter_mode || 'auto_weekly_utc' }}
+          BT_TIME_FROM: ${{ inputs.time_from }}
+          BT_TIME_TO: ${{ inputs.time_to }}
+          BT_WEEKS_BACK: ${{ inputs.weeks_back || '1' }}
+          BT_WEEKLY_ANCHOR_ISO: ${{ inputs.weekly_anchor_iso }}
+
         run: |
           python bt/estimate.py
