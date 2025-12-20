@@ -52,9 +52,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # --- 例（ダミー） ---
-          # - game_title_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-          #   format_id:     "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
+          # SVWB Rotation
+          - game_title_id: "619bcbc6-0c7b-40cb-a9fe-77df73a95d51"
+            format_id: "d0134178-79c9-4041-a87b-95980526d2f1"
           # - game_title_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
           #   format_id:     "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
           #
