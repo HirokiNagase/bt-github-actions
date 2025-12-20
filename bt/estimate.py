@@ -9,6 +9,8 @@ from psycopg.rows import dict_row
 from scipy.optimize import minimize
 from collections import defaultdict
 
+from datetime import datetime, timedelta, timezone  # ★追加（週区切りUTC計算用）
+
 # =============================================================================
 # このスクリプトの目的
 # -----------------------------------------------------------------------------
@@ -61,6 +63,96 @@ FILTER_FORMAT_ID = env_uuid("BT_FORMAT_ID")
 # - half:   引き分けを「両者が0.5勝」としてモデルに入れる（簡易な扱い）
 DRAW_MODE = os.environ.get("BT_DRAW_MODE", "ignore")
 
+# -----------------------------------------------------------------------------
+# ★追加：期間フィルタの運用方針（matched_datetime はUTCとして保存されている前提）
+#
+# matches.matched_datetime が '2025-12-14 00:00:00' のような形式（tz無し）で入っており、
+# それを「UTC時刻として解釈」して絞り込みたい、という要件に合わせる。
+#
+# BT_TIME_FILTER_MODE:
+#   - "auto_weekly_utc": UTC週区切り（月曜0:00 UTC）で直近1週間 [from,to) を自動生成
+#   - "env": BT_TIME_FROM/BT_TIME_TO をそのまま使う（手動指定）
+#   - "off": 期間絞り込みを無効（全範囲。デバッグ用途）
+#
+# BT_TIME_FROM / BT_TIME_TO:
+#   DBの形式に揃えるのが安全: 'YYYY-MM-DD HH:MM:SS'
+#
+# BT_WEEKLY_ANCHOR_ISO:
+#   自動生成の基準時刻（再現性のための固定値）
+#   例: '2025-12-20T12:00:00Z'
+#
+# BT_WEEKS_BACK:
+#   何週間分遡るか（通常 1）
+# -----------------------------------------------------------------------------
+
+# 手動指定（envモードで使用）
+BT_TIME_FROM = os.environ.get("BT_TIME_FROM")  # inclusive
+BT_TIME_TO = os.environ.get("BT_TIME_TO")      # exclusive
+
+def compute_week_window_utc(
+    *,
+    anchor_utc: Optional[datetime] = None,
+    weeks_back: int = 1,
+) -> Tuple[str, str]:
+    """
+    UTC週区切り（月曜0:00 UTC）で [from, to) を作り、
+    matched_datetime（tz無し）に合わせて 'YYYY-MM-DD HH:MM:SS' で返す。
+
+    なぜ [from,to) なのか:
+      - inclusive/exclusive にすると、週を跨いだ集計で境界が二重カウントされない。
+    """
+    if anchor_utc is None:
+        anchor_utc = datetime.now(timezone.utc)
+    if anchor_utc.tzinfo is None:
+        anchor_utc = anchor_utc.replace(tzinfo=timezone.utc)
+
+    # 直近の「月曜 00:00:00 UTC」を求める
+    # weekday(): Mon=0 ... Sun=6
+    days_since_monday = anchor_utc.weekday()
+    this_monday_00 = (anchor_utc - timedelta(days=days_since_monday)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+
+    to_utc = this_monday_00
+    from_utc = to_utc - timedelta(days=7 * weeks_back)
+
+    def fmt(dt: datetime) -> str:
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    return fmt(from_utc), fmt(to_utc)
+
+def resolve_time_filter_window_utc() -> Tuple[Optional[str], Optional[str]]:
+    """
+    期間フィルタに使う (time_from, time_to) を決定する。
+
+    - mode=off のときは (None, None) を返し、SQLに条件を入れない（全範囲）
+    - mode=env のときは BT_TIME_FROM/TO をそのまま使う（手動）
+    - mode=auto_weekly_utc のときは UTC週区切りで自動生成する（通常運用）
+    """
+    mode = os.environ.get("BT_TIME_FILTER_MODE", "auto_weekly_utc").strip().lower()
+
+    if mode == "off":
+        return None, None
+
+    if mode == "env":
+        # 手動指定。DBに合わせて 'YYYY-MM-DD HH:MM:SS' を推奨。
+        return BT_TIME_FROM, BT_TIME_TO
+
+    if mode == "auto_weekly_utc":
+        anchor_iso = os.environ.get("BT_WEEKLY_ANCHOR_ISO")  # 例: 2025-12-20T12:00:00Z
+        anchor_utc: Optional[datetime] = None
+        if anchor_iso:
+            s = anchor_iso.strip().replace("Z", "+00:00")
+            anchor_utc = datetime.fromisoformat(s)
+            if anchor_utc.tzinfo is None:
+                anchor_utc = anchor_utc.replace(tzinfo=timezone.utc)
+
+        weeks_back = int(os.environ.get("BT_WEEKS_BACK", "1"))
+        return compute_week_window_utc(anchor_utc=anchor_utc, weeks_back=weeks_back)
+
+    raise ValueError(f"Unknown BT_TIME_FILTER_MODE={mode!r}")
+
+
 # 区間の信頼係数（95%CIなら 1.96）
 # 例:
 #   90% CI ≈ 1.645
@@ -111,6 +203,18 @@ def fetch_matches(conn: psycopg.Connection) -> Tuple[List[MatchRow], Optional[st
     if FILTER_FORMAT_ID:
         where.append("a_my.format_id = %(format_id)s")
         params["format_id"] = FILTER_FORMAT_ID
+
+    # ★変更：期間フィルタ（matched_datetimeをUTCとして解釈して絞る）
+    # 手動指定(env) or 自動週区切り(auto_weekly_utc) or 無効(off) を切り替え可能。
+    time_from, time_to = resolve_time_filter_window_utc()
+
+    if time_from:
+        where.append("m.matched_datetime >= %(time_from)s")
+        params["time_from"] = time_from
+
+    if time_to:
+        where.append("m.matched_datetime < %(time_to)s")
+        params["time_to"] = time_to
 
     sql = f"""
     select
@@ -498,7 +602,6 @@ def main() -> None:
     """
     as_of_iso = os.environ.get("BT_AS_OF")  # 例: 2025-12-18T00:00:00Z
     if not as_of_iso:
-        from datetime import datetime, timezone
         as_of_iso = datetime.now(timezone.utc).isoformat()
 
     with psycopg.connect(DATABASE_URL) as conn:
